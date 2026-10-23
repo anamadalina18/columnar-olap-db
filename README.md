@@ -8,37 +8,78 @@ versioned, Iceberg-inspired metadata layer with column-level statistics.
 the `Value`/`TableChunk`/operator traits, file-storage plumbing, benchmarks and the test suite.
 This repository contains **only the files I implemented**, so it does not build standalone.
 
-## What I implemented
+## Architecture
 
-**Storage format (`storage/data.rs`).** Serialization and deserialization of data files: an 8-byte
-magic header, row/column counts, and a per-column descriptor (type + byte offset) followed by the
-column values. Two read paths are implemented — full parse and **projected parse** for a subset of
-columns, which only reads the requested columns.
+### On-disk layout
 
-**Vectorized operators (`engine/operators.rs`).** Chunk-at-a-time execution with:
+A table is a set of immutable data files, one per chunk. A file is self-describing:
 
-- `ColumnTableScan` — scans a set of data files with column projection;
-- `ColumnFilter` — conjunctive predicate evaluation over chunks;
-- `ColumnAggregate` — pluggable `AggFunc` over a column;
-- `ColumnEqJoin` — hash join on a single column.
+```
+magic "SDMS\x19\x03JS" | rows: u64 | columns: u64 | N × (type: 8B, start: 8B) | column data...
+```
 
-**Iceberg-style metadata.**
+The header stores, for every column, its type and its byte offset, which is what makes **projection
+pushdown** possible: `parse_columns` seeks straight to the requested columns and never reads the
+others. Values inside a column are stored consecutively (`Vec<Value>`, with `Option` for nulls in a
+chunk), so a scan hands whole columns to the next operator.
 
-- Column `MinMax` statistics and `FileStats` (`iceberg/stats.rs`), including overlap checks for
-  equality and range predicates;
-- `Manifest` (`iceberg/manifest.rs`) — added/deleted file lists per version plus the stats of added
-  files, and iterator-returning predicate filtering (`contains`, `contains_range`);
-- `TableMetadata` (`iceberg/table_metadata.rs`) — snapshot at an arbitrary `Version`, effective file
-  set (added minus deleted, applied manifest by manifest), predicate-based pruning at a version, and
-  version creation.
+### Execution
 
-**Write path (`engine/db_engine.rs`).** `start_table_modification` / `commit` plus
-`insert`, `update`, `delete` and `delete_chunks`: chunks are rewritten to new files, statistics are
-recomputed, changes are recorded in the manifest, and conflicting or duplicate modifications of the
-same file inside one version are rejected.
+Operators are pull-based and work on chunks, never on single rows:
 
-**Value semantics (`value_cmp.rs`).** `PartialOrd`/`Ord` for `Value` across `Int`, `UInt`, `RowID`
-and `Varchar`.
+```
+ColumnTableScan → ColumnFilter → ColumnAggregate
+                               → ColumnEqJoin
+```
+
+- `ColumnTableScan` iterates the file handles selected by the metadata layer, with a column
+  projection mask.
+- `ColumnFilter` evaluates conjunctive predicates over a chunk and emits the surviving rows.
+- `ColumnAggregate` applies a boxed `AggFunc` to a column.
+- `ColumnEqJoin` builds a hash table on one side and probes with the other.
+
+### Metadata and versioning
+
+`Catalog` holds `TableMetadata`, which holds an ordered `Vec<Manifest>` — one manifest per committed
+modification, i.e. one per version. A manifest records `added` and `deleted` file handles plus the
+`FileStats` of every added file.
+
+Reading a version means replaying manifests from the beginning: add the files of each manifest, then
+remove the ones it deleted. `TableMetadata::files(version)` does exactly that, so a snapshot of any
+past version can be reconstructed without copying data.
+
+Pruning happens at two levels: `TableMetadata::contains` / `contains_range` walk the manifests of the
+requested version and keep only files whose statistics overlap the predicates; `Manifest::contains`
+does the same per manifest. Statistics are `MinMax` per column, so a file is skipped when its
+`[min, max]` does not intersect the predicate.
+
+### Write path
+
+`start_table_modification(table_id)` opens a modification; `insert`, `update`, `delete` and
+`delete_chunks` accumulate changes into the current manifest; `commit()` appends the manifest and
+increments the version. `insert` writes a new file per chunk and computes its stats; `update` and
+`delete` read the affected chunk, rewrite it as a new file with fresh statistics, and record the old
+file as deleted. Any attempt to modify the same file twice in one version is rejected with
+`EngineError`, which keeps a manifest duplicate-free by construction.
+
+## Limitations
+
+- **Single-threaded, no concurrency control.** There is no transaction manager, no latch on the
+  catalog, and no isolation between readers and writers — the engine is a lab prototype of the
+  storage/metadata layer, not a DBMS.
+- **Copy-on-write updates.** Updating one row rewrites the whole chunk to a new file; the same holds
+  for row deletes. Write amplification is proportional to the chunk size.
+- **No compaction.** Deleted files stay in the catalog history forever and old versions are never
+  garbage-collected, so both metadata and storage grow with the number of modifications.
+- **MinMax statistics only.** No null counts, no distinct counts, no bloom filters, and pruning is
+  file-level — there are no finer row-group zone maps.
+- **No compression or encoding.** Columns are stored raw (no dictionary, RLE or bit-packing), so
+  files are larger and scans read more bytes than a real columnar format would.
+- **Full-file materialization.** Projection pushdown reduces the number of columns read, but the
+  selected columns are always read completely; there is no late materialization or vectorized
+  decoding step.
+- **No predicate pushdown into the reader.** Predicates are evaluated by `ColumnFilter`, not by the
+  storage layer, so the scan cannot stop early.
 
 ## Files
 
@@ -54,7 +95,7 @@ and `Varchar`.
 
 ## Notes
 
-- The engine keeps one metadata version per committed modification, so a table can be queried at any
-  past version.
-- The data-file layout is also exercised by the course benchmarks (`query_bench`), where file pruning
-  via statistics is the main win.
+- One manifest per committed modification keeps the history append-only: the effective file set is
+  always a fold over the manifest list.
+- The data-file layout and the pruning path are also exercised by the course benchmarks, where file
+  pruning via statistics is the main win.
