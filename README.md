@@ -81,6 +81,20 @@ file as deleted. Any attempt to modify the same file twice in one version is rej
 - **No predicate pushdown into the reader.** Predicates are evaluated by `ColumnFilter`, not by the
   storage layer, so the scan cannot stop early.
 
+## Performance
+
+Measured locally on an **Intel Core i5-12450H (8 cores / 12 threads), 16 GB RAM, Windows 11**,
+`cargo --release`, single run, synthetic data. Indicative numbers, not a controlled suite.
+
+| Workload | Result |
+|---|---|
+| Insert, 1 M rows × 2 `UInt` columns, 10 files of 100 k rows | **6.8 M rows/s** |
+| Full scan, both columns | **4.3 M rows/s** |
+| Filter (`col1 ∈ [0, 9]`, ~1% selectivity) | **2.3 M rows/s** in, 10,113 rows out |
+
+The filter is slower per input row than the raw scan because every chunk is materialized and then
+predicate-checked; with file pruning the scan itself would read less data.
+
 ## Files
 
 | Path | Contents |
